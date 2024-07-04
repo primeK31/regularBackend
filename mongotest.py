@@ -64,6 +64,9 @@ db = client["lol1"]
 collection = db["lol1"]
 
 
+os.makedirs('uploads/', exist_ok=True)
+
+
 @app.post("/uploadfile/")
 async def upload_file(file: UploadFile = File(...), text: Optional[str] = Form(None), ):
     file_location = f"uploads/{file.filename}"
