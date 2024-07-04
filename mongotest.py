@@ -70,7 +70,7 @@ os.makedirs('uploads/', exist_ok=True)
 @app.post("/uploadfile/")
 async def upload_file(file: UploadFile = File(...), text: Optional[str] = Form(None), ):
     file_location = f"uploads/{file.filename}"
-    text += " "
+    text += "."
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
     document = {
