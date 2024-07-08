@@ -1,13 +1,37 @@
 import shutil
 from typing import List, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 from pydantic import BaseModel
-from motor.motor_asyncio import AsyncIOMotorClient
+from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 import os
+import fitz
+import boto3
+import uuid
+
+load_dotenv()
 
 app = FastAPI()
-path = ''
+
+
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+AWS_REGION = os.getenv("AWS_REGION")
+
+
+if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME, AWS_REGION]):
+    raise ValueError("One or more environment variables are not set. Please check your .env file.")
+
+
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    region_name=AWS_REGION
+)
+
 
 def get_pdf_text(pdf_path):
     path = pdf_path
@@ -21,13 +45,9 @@ def get_pdf_text(pdf_path):
 
 
 from pymongo import MongoClient
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 
-load_dotenv()
 
 aiclient = OpenAI()
 
@@ -51,38 +71,45 @@ app.add_middleware(
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 uri = os.getenv('MONGO_URI')
-# Create a new client and connect to the server
+
 client = MongoClient(uri, server_api=ServerApi('1'))
-# Send a ping to confirm a successful connection
+
 try:
     client.admin.command('ping')
     print("Pinged your deployment. You successfully connected to MongoDB!")
 except Exception as e:
     print(e)
 
+
 db = client["lol1"]
 collection = db["lol1"]
 
 
-os.makedirs('uploads/', exist_ok=True)
-
-
 @app.post("/uploadfile/")
 async def upload_file(file: UploadFile = File(...), text: Optional[str] = Form(None), ):
-    file_location = f"uploads/{file.filename}"
-    text += "."
-    with open(file_location, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    document = {
-        "pdf_name": file.filename,
-        "user_text": text
-    }
+    try:
+        unique_filename = f"{uuid.uuid4()}_{file.filename}"
+        file_contents = await file.read()
+        s3_client.put_object(Bucket=S3_BUCKET_NAME, Key=unique_filename, Body=file_contents)
+        if(text != None):
+            document = {
+                "pdf_name": unique_filename,
+                "user_text": text
+            }
+        else:
+            document = {
+                "pdf_name": unique_filename,
+            } 
 
-    collection.insert_one(document)
-    return {
-        "pdf_name": file.filename,
-        "user_text": text
-    }
+        collection.insert_one(document)
+        return {
+            "pdf_name": unique_filename,
+        }
+
+    except (NoCredentialsError, PartialCredentialsError):
+        raise HTTPException(status_code=500, detail="AWS credentials not configured properly")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
 
 
 class VectorData(BaseModel):
@@ -91,30 +118,39 @@ class VectorData(BaseModel):
     vector: List[float]
 
 
-class NameRequest(BaseModel):
-    name: str
-
-
 @app.get("/vector")
 def get_vector_by_name(name: str):
     vector_data = collection.find_one({"pdf_name": name})
     if not vector_data:
         raise HTTPException(status_code=404, detail="Vector not found")
     
-    pdf_content = get_pdf_text(vector_data['pdf_name'])
-    text = vector_data['user_text']
-    if os.path.exists(f"uploads/{vector_data['pdf_name']}"):
-        os.remove(f"uploads/{vector_data['pdf_name']}")
-        print(f"File uploads/{vector_data['pdf_name']} deleted successfully")
-    else:
-        print(f"File uploads/{vector_data['pdf_name']} does not exist")
+    response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=name)
+
+    file_contents = response['Body'].read()
+
+    pdf_document = fitz.open(stream=file_contents, filetype="pdf")
+
+    pdf_text = ""
+    for page_num in range(len(pdf_document)):
+        page = pdf_document.load_page(page_num)
+        pdf_text += page.get_text()
+
+    text = "Create quiz"
+    
+    document_identifier = {'pdf_name': name} 
+    field_name = 'user_text'
+
+    result = collection.find_one({**document_identifier, field_name: {"$exists": True}})
+
+    if result:
+        text = vector_data['user_text']
 
     completion = aiclient.chat.completions.create(
         model="gpt-4o",
         messages=[
             {
                 "role": "user",
-                "content": f"Give me a name of this document with quotes without your comments based on text of this document: {pdf_content}"
+                "content": f"Give me a name of this document with quotes without your comments based on text of this document: {pdf_text}"
             },
         ]
     )
@@ -134,7 +170,7 @@ def get_vector_by_name(name: str):
             },
             {
                 "role": "user",
-                "content": f"Write me one json without any comment from you for google forms api updating google form quiz without adding name and title by adding ONLY MCQ test questions based on this text: {pdf_content}"
+                "content": f"Write me one json without any comment from you for google forms api updating google form quiz without adding name and title by adding ONLY MCQ test questions based on this text: {pdf_text}"
             },
             {
                 "role": "user",
@@ -144,7 +180,7 @@ def get_vector_by_name(name: str):
     )
 
     return {"filename": vector_data['pdf_name'],
-            "pdf_content": pdf_content,
+            "pdf_content": pdf_text,
             "form_name": completion.choices[0].message.content,
             "questions": response.choices[0].message.content,
             "google_api_key": os.getenv('GOOGLE_API_KEY')
